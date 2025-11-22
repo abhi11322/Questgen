@@ -758,32 +758,63 @@ def generate_paper():
     def norm_text(s):
         return (clean_question_text(s or '') or '').lower().strip()
     def pick_question(target_marks=None, prefer_rbt=None, prefer_co=None, prefer_module=None):
-        # 1) exact marks match and not used
+        # 1) exact marks match with optional module/RBT constraints and not used
         search_pools = []
         if prefer_module and prefer_module in module_groups:
             search_pools.append(module_groups.get(prefer_module, []))
-        # fallback pool (any module)
-        search_pools.append(all_q)
+        # fallback pool (any module) only when module distribution is not enforced
+        try:
+            module_active = bool(module_percents)
+        except Exception:
+            module_active = False
+        if not module_active or not prefer_module:
+            search_pools.append(all_q)
         for pool in search_pools:
             for q in pool:
                 if q.id in used_ids:
                     continue
                 if target_marks is not None and q.marks == target_marks and norm_text(q.text) not in used_texts:
-                    return q
+                    # If RBT distribution is active, ensure either preferred RBT matches or at least the level has remaining capacity
+                    if prefer_rbt is not None:
+                        if q.rbt_level == prefer_rbt:
+                            return q
+                    else:
+                        # No specific preference; enforce availability if configured
+                        try:
+                            rbt_active = any(rbt_percents.values())
+                        except Exception:
+                            rbt_active = False
+                        if not rbt_active or rbt_allowed(q.rbt_level):
+                            return q
         # 2) any not used with preferred rbt/co
         for pool in search_pools:
             for q in pool:
                 if q.id in used_ids:
                     continue
                 if prefer_rbt and q.rbt_level == prefer_rbt and norm_text(q.text) not in used_texts:
-                    return q
+                    # also ensure availability if RBT plan active
+                    try:
+                        if not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
+                            return q
+                    except Exception:
+                        return q
                 if prefer_co and prefer_co in (q.co_tags or []) and norm_text(q.text) not in used_texts:
-                    return q
+                    # if RBT plan is active, still ensure availability for the question's level
+                    try:
+                        if not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
+                            return q
+                    except Exception:
+                        return q
         # 3) any not used
         for pool in search_pools:
             for q in pool:
                 if q.id not in used_ids and norm_text(q.text) not in used_texts:
-                    return q
+                    # final fallback respects RBT availability if configured
+                    try:
+                        if not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
+                            return q
+                    except Exception:
+                        return q
         return None
 
     # Prepare module distribution plan based on percentages (over total parts)
@@ -825,6 +856,38 @@ def generate_paper():
         module_plan.extend([m] * cnt)
     plan_idx = 0
 
+    # Prepare RBT distribution plan based on percentages (L1-L5 over total parts)
+    rbt_percents = config.get('rbt_percentages') or {}
+    # Normalize keys to canonical L1-L5 strings
+    rbt_keys = ['L1','L2','L3','L4','L5']
+    rbt_percents = {k: int(rbt_percents.get(k, 0)) for k in rbt_keys}
+    remaining_rbt = {}
+    if total_parts > 0 and any(rbt_percents.values()):
+        assigned = 0
+        remainders = []
+        for lvl, pct in rbt_percents.items():
+            exact = pct * total_parts / 100.0
+            cnt = int(exact)
+            remaining_rbt[lvl] = cnt
+            assigned += cnt
+            remainders.append((lvl, exact - cnt))
+        leftover = max(0, total_parts - assigned)
+        remainders.sort(key=lambda x: x[1], reverse=True)
+        i = 0
+        while leftover > 0 and i < len(remainders):
+            lvl = remainders[i][0]
+            remaining_rbt[lvl] = remaining_rbt.get(lvl, 0) + 1
+            leftover -= 1
+            i = (i + 1) % max(1, len(remainders))
+    def rbt_allowed(lvl):
+        if not any(rbt_percents.values()):
+            return True
+        return remaining_rbt.get(lvl, 0) > 0
+    rbt_plan = []
+    for lvl, cnt in remaining_rbt.items():
+        rbt_plan.extend([lvl] * cnt)
+    rbt_idx = 0
+
     # Avoid reusing questions from recent drafts of same subject/scheme
     recent = PaperDraft.query.filter_by(scheme_id=scheme_id, subject_id=subject_id).order_by(PaperDraft.created_at.desc()).limit(5).all()
     for d in recent:
@@ -852,7 +915,9 @@ def generate_paper():
             if q.subparts and len(q.subparts) >= len(parts):
                 # Enforce module percentages: require remaining capacity for this module to cover all parts
                 qm = q.module or 0
-                if not module_percents or remaining_counts.get(qm, 0) >= len(parts):
+                qlvl = q.rbt_level
+                rbt_ok = (not any(rbt_percents.values())) or (qlvl in remaining_rbt and remaining_rbt.get(qlvl, 0) >= len(parts))
+                if (not module_percents or remaining_counts.get(qm, 0) >= len(parts)) and rbt_ok:
                     chosen = q
                     break
         if chosen is not None:
@@ -868,11 +933,15 @@ def generate_paper():
                     "rbt": chosen.rbt_level,
                     "source_qid": chosen.id,
                 })
-            # Decrement remaining count for module for each part consumed
+            # Decrement remaining count for module and RBT for each part consumed
             if module_percents:
                 qm = chosen.module or 0
                 if qm in remaining_counts:
                     remaining_counts[qm] = max(0, remaining_counts[qm] - len(parts))
+            if any(rbt_percents.values()):
+                qlvl = chosen.rbt_level
+                if qlvl in remaining_rbt:
+                    remaining_rbt[qlvl] = max(0, remaining_rbt[qlvl] - len(parts))
             rows.append(row)
             continue
         # Otherwise pick per-part
@@ -882,30 +951,50 @@ def generate_paper():
             prefer_module = None
             if plan_idx < len(module_plan):
                 prefer_module = module_plan[plan_idx]
+            # Choose preferred RBT per plan when available
+            prefer_rbt = None
+            if rbt_idx < len(rbt_plan):
+                prefer_rbt = rbt_plan[rbt_idx]
             q = None
             # First, enforce module plan strictly if available
             if module_percents:
                 # If we have a preferred module with remaining count, search only within that module
                 if prefer_module is not None and module_allowed(prefer_module):
-                    q = pick_question(target_mk, prefer_module=prefer_module)
+                    # Try with RBT preference too if applicable
+                    if prefer_rbt is not None and rbt_allowed(prefer_rbt):
+                        q = pick_question(target_mk, prefer_module=prefer_module, prefer_rbt=prefer_rbt)
+                    if q is None:
+                        q = pick_question(target_mk, prefer_module=prefer_module)
                 # If not found, try any module that still has remaining count
                 if q is None:
                     for mod in [m for m,cnt in remaining_counts.items() if cnt > 0]:
-                        q = pick_question(target_mk, prefer_module=mod)
+                        if prefer_rbt is not None and rbt_allowed(prefer_rbt):
+                            q = pick_question(target_mk, prefer_module=mod, prefer_rbt=prefer_rbt)
+                        if q is None:
+                            q = pick_question(target_mk, prefer_module=mod)
                         if q is not None:
                             prefer_module = mod
                             break
             # If no module percentages provided, allow any module as fallback
             # If percentages are configured, DO NOT pick from modules with zero remaining
             if q is None and not module_percents:
-                q = pick_question(target_mk)
+                if prefer_rbt is not None and rbt_allowed(prefer_rbt):
+                    q = pick_question(target_mk, prefer_rbt=prefer_rbt)
+                if q is None:
+                    q = pick_question(target_mk)
             if q is not None:
                 used_ids.add(q.id)
                 # decrement remaining for module if applicable
                 qm = q.module or prefer_module
                 if module_percents and qm is not None and qm in remaining_counts and remaining_counts[qm] > 0:
                     remaining_counts[qm] -= 1
+                # decrement remaining for RBT if applicable
+                if any(rbt_percents.values()):
+                    qlvl = q.rbt_level or prefer_rbt
+                    if qlvl in remaining_rbt and remaining_rbt[qlvl] > 0:
+                        remaining_rbt[qlvl] -= 1
                 plan_idx += 1
+                rbt_idx += 1
                 used_texts.add(norm_text(q.text))
                 row["parts"].append({
                     "label": p,
