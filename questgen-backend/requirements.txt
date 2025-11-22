@@ -1,0 +1,6 @@
+Flask==2.3.3
+Flask-CORS==3.0.10
+SQLAlchemy==2.0.21
+flask-sqlalchemy==3.0.5
+pdfplumber==0.10.3
+python-dotenv==1.0.0
