@@ -532,7 +532,8 @@ def get_module_note_file(mid: int):
     m = ModuleNote.query.get_or_404(mid)
     if not os.path.exists(m.file_path):
         return jsonify({"errors": ["File not found on server"]}), 404
-    return send_file(m.file_path, mimetype='application/pdf', as_attachment=False, download_name=m.file_name)
+    download = request.args.get('download', default=0, type=int)
+    return send_file(m.file_path, mimetype='application/pdf', as_attachment=bool(download), download_name=m.file_name)
 
 @app.route('/api/questions', methods=['GET'])
 def get_questions():
@@ -757,23 +758,23 @@ def generate_paper():
     used_texts = set()
     def norm_text(s):
         return (clean_question_text(s or '') or '').lower().strip()
-    def pick_question(target_marks=None, prefer_rbt=None, prefer_co=None, prefer_module=None):
+    def pick_question(target_marks=None, prefer_rbt=None, prefer_co=None, prefer_module=None, ignore_rbt_allocation=False, ignore_module_allocation=False, allow_reuse=False):
         # 1) exact marks match with optional module/RBT constraints and not used
         search_pools = []
-        if prefer_module and prefer_module in module_groups:
+        if prefer_module and prefer_module in module_groups and not ignore_module_allocation:
             search_pools.append(module_groups.get(prefer_module, []))
-        # fallback pool (any module) only when module distribution is not enforced
+        # fallback pool (any module) only when module distribution is not enforced or ignoring module allocation
         try:
             module_active = bool(module_percents)
         except Exception:
             module_active = False
-        if not module_active or not prefer_module:
+        if ignore_module_allocation or not module_active or not prefer_module:
             search_pools.append(all_q)
         for pool in search_pools:
             for q in pool:
-                if q.id in used_ids:
+                if q.id in used_ids and not allow_reuse:
                     continue
-                if target_marks is not None and q.marks == target_marks and norm_text(q.text) not in used_texts:
+                if target_marks is not None and q.marks == target_marks and (allow_reuse or norm_text(q.text) not in used_texts):
                     # If RBT distribution is active, ensure either preferred RBT matches or at least the level has remaining capacity
                     if prefer_rbt is not None:
                         if q.rbt_level == prefer_rbt:
@@ -784,34 +785,34 @@ def generate_paper():
                             rbt_active = any(rbt_percents.values())
                         except Exception:
                             rbt_active = False
-                        if not rbt_active or rbt_allowed(q.rbt_level):
+                        if ignore_rbt_allocation or (not rbt_active or rbt_allowed(q.rbt_level)):
                             return q
         # 2) any not used with preferred rbt/co
         for pool in search_pools:
             for q in pool:
-                if q.id in used_ids:
+                if q.id in used_ids and not allow_reuse:
                     continue
-                if prefer_rbt and q.rbt_level == prefer_rbt and norm_text(q.text) not in used_texts:
+                if prefer_rbt and q.rbt_level == prefer_rbt and (allow_reuse or norm_text(q.text) not in used_texts):
                     # also ensure availability if RBT plan active
                     try:
-                        if not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
+                        if ignore_rbt_allocation or not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
                             return q
                     except Exception:
                         return q
-                if prefer_co and prefer_co in (q.co_tags or []) and norm_text(q.text) not in used_texts:
+                if prefer_co and prefer_co in (q.co_tags or []) and (allow_reuse or norm_text(q.text) not in used_texts):
                     # if RBT plan is active, still ensure availability for the question's level
                     try:
-                        if not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
+                        if ignore_rbt_allocation or not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
                             return q
                     except Exception:
                         return q
         # 3) any not used
         for pool in search_pools:
             for q in pool:
-                if q.id not in used_ids and norm_text(q.text) not in used_texts:
+                if (q.id not in used_ids or allow_reuse) and (allow_reuse or norm_text(q.text) not in used_texts):
                     # final fallback respects RBT availability if configured
                     try:
-                        if not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
+                        if ignore_rbt_allocation or not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
                             return q
                     except Exception:
                         return q
@@ -819,6 +820,7 @@ def generate_paper():
 
     # Prepare module distribution plan based on percentages (over total parts)
     module_percents = config.get('module_percentages') or {}
+    best_effort = bool(config.get('best_effort'))
     # Normalize keys to int
     module_percents = {int(k): int(module_percents[k]) for k in module_percents.keys() if str(k).isdigit()}
     total_parts = 0
@@ -856,10 +858,10 @@ def generate_paper():
         module_plan.extend([m] * cnt)
     plan_idx = 0
 
-    # Prepare RBT distribution plan based on percentages (L1-L5 over total parts)
+    # Prepare RBT distribution plan based on percentages (L1-L6 over total parts)
     rbt_percents = config.get('rbt_percentages') or {}
-    # Normalize keys to canonical L1-L5 strings
-    rbt_keys = ['L1','L2','L3','L4','L5']
+    # Normalize keys to canonical L1-L6 strings
+    rbt_keys = ['L1','L2','L3','L4','L5','L6']
     rbt_percents = {k: int(rbt_percents.get(k, 0)) for k in rbt_keys}
     remaining_rbt = {}
     if total_parts > 0 and any(rbt_percents.values()):
@@ -918,6 +920,13 @@ def generate_paper():
                 qlvl = q.rbt_level
                 rbt_ok = (not any(rbt_percents.values())) or (qlvl in remaining_rbt and remaining_rbt.get(qlvl, 0) >= len(parts))
                 if (not module_percents or remaining_counts.get(qm, 0) >= len(parts)) and rbt_ok:
+                    chosen = q
+                    break
+        # Best-effort: if not found, allow ignoring allocations for subparts questions
+        if chosen is None and best_effort:
+            for q in all_q:
+                # allow reuse under best-effort
+                if q.subparts and len(q.subparts) >= len(parts):
                     chosen = q
                     break
         if chosen is not None:
@@ -982,6 +991,29 @@ def generate_paper():
                     q = pick_question(target_mk, prefer_rbt=prefer_rbt)
                 if q is None:
                     q = pick_question(target_mk)
+
+            # Best-effort progressive relaxation if still not found
+            if q is None and best_effort:
+                # 1) keep module preference, ignore RBT allocation
+                if prefer_module is not None and module_allowed(prefer_module):
+                    if prefer_rbt is not None:
+                        q = pick_question(target_mk, prefer_module=prefer_module, prefer_rbt=prefer_rbt, ignore_rbt_allocation=True)
+                    if q is None:
+                        q = pick_question(target_mk, prefer_module=prefer_module, ignore_rbt_allocation=True)
+                # 2) keep RBT preference, ignore module allocation
+                if q is None and prefer_rbt is not None:
+                    q = pick_question(target_mk, prefer_rbt=prefer_rbt, ignore_module_allocation=True)
+                # 3) ignore both allocations
+                if q is None:
+                    q = pick_question(target_mk, ignore_rbt_allocation=True, ignore_module_allocation=True)
+                # 4) as a last resort, allow reuse
+                if q is None:
+                    if prefer_module is not None and module_allowed(prefer_module):
+                        q = pick_question(target_mk, prefer_module=prefer_module, allow_reuse=True, ignore_rbt_allocation=True)
+                    if q is None and prefer_rbt is not None:
+                        q = pick_question(target_mk, prefer_rbt=prefer_rbt, allow_reuse=True, ignore_module_allocation=True)
+                    if q is None:
+                        q = pick_question(target_mk, allow_reuse=True, ignore_rbt_allocation=True, ignore_module_allocation=True)
             if q is not None:
                 used_ids.add(q.id)
                 # decrement remaining for module if applicable
