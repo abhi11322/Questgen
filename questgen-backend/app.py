@@ -2,10 +2,8 @@ import os
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import Enum
 from datetime import datetime
 import enum
-import tempfile
 import pdfplumber
 
 app = Flask(__name__)
@@ -27,6 +25,43 @@ class QuestionStatus(enum.Enum):
 class PaperStatus(enum.Enum):
     DRAFT = "DRAFT"
     FINAL = "FINAL"
+
+class UserRole(enum.Enum):
+    TEACHER = "TEACHER"
+    STUDENT = "STUDENT"
+
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    firebase_uid = db.Column(db.String(128), unique=True, nullable=False)
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    first_name = db.Column(db.String(100), nullable=False)
+    last_name = db.Column(db.String(100), nullable=False)
+    role = db.Column(db.Enum(UserRole), nullable=False)
+    department = db.Column(db.String(255))  # For teachers
+    semester = db.Column(db.Integer)  # For students
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TaskStatus(enum.Enum):
+    PENDING = "PENDING"
+    DONE = "DONE"
+
+class StudentTask(db.Model):
+    __tablename__ = 'student_tasks'
+    id = db.Column(db.Integer, primary_key=True)
+    student_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    title = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text)
+    due_date = db.Column(db.DateTime, nullable=True)
+    start_time = db.Column(db.DateTime, nullable=True)
+    end_time = db.Column(db.DateTime, nullable=True)
+    status = db.Column(db.Enum(TaskStatus), default=TaskStatus.PENDING, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 
 class Scheme(db.Model):
     __tablename__ = 'schemes'
@@ -113,8 +148,43 @@ class PaperDraft(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+# -------- Scheduling --------
+class AudienceType(enum.Enum):
+    ALL = "ALL"
+    SEMESTER = "SEMESTER"
+    STUDENT = "STUDENT"
+
+class ScheduleEvent(db.Model):
+    __tablename__ = 'schedule_events'
+    id = db.Column(db.Integer, primary_key=True)
+    teacher_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    title = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text)
+    subject_id = db.Column(db.Integer, db.ForeignKey('subjects.id'))
+    location = db.Column(db.String(255))
+    start_time = db.Column(db.DateTime, nullable=False)
+    end_time = db.Column(db.DateTime, nullable=False)
+    audience = db.Column(db.Enum(AudienceType), nullable=False, default=AudienceType.ALL)
+    semester = db.Column(db.Integer)  # required when audience == SEMESTER
+    student_id = db.Column(db.Integer, db.ForeignKey('users.id'))  # required when audience == STUDENT
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 with app.app_context():
     db.create_all()
+    # Ensure new columns exist for StudentTask when using SQLite (basic migration)
+    try:
+        if DB_URL.startswith('sqlite'):
+            from sqlalchemy import text
+            info = db.session.execute(text("PRAGMA table_info(student_tasks)")).fetchall()
+            cols = {row[1] for row in info}
+            if 'start_time' not in cols:
+                db.session.execute(text("ALTER TABLE student_tasks ADD COLUMN start_time DATETIME"))
+            if 'end_time' not in cols:
+                db.session.execute(text("ALTER TABLE student_tasks ADD COLUMN end_time DATETIME"))
+            db.session.commit()
+    except Exception:
+        db.session.rollback()
 
 # Helpers
 import re
@@ -215,6 +285,275 @@ def clean_question_text(s: str) -> str:
     # Collapse extra spaces
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+# -------- Scheduling Helpers --------
+def _parse_iso(dt_str):
+    try:
+        if not dt_str:
+            return None
+        # Support Z suffix
+        ds = dt_str.replace('Z', '+00:00')
+        return datetime.fromisoformat(ds)
+    except Exception:
+        return None
+
+def _event_to_json(ev: 'ScheduleEvent'):
+    return {
+        'id': ev.id,
+        'teacher_id': ev.teacher_id,
+        'title': ev.title,
+        'description': ev.description,
+        'subject_id': ev.subject_id,
+        'location': ev.location,
+        'start_time': ev.start_time.isoformat() if ev.start_time else None,
+        'end_time': ev.end_time.isoformat() if ev.end_time else None,
+        'audience': ev.audience.value,
+        'semester': ev.semester,
+        'student_id': ev.student_id,
+        'created_at': ev.created_at.isoformat() if ev.created_at else None,
+        'updated_at': ev.updated_at.isoformat() if ev.updated_at else None,
+    }
+
+def _task_to_json(t: 'StudentTask'):
+    return {
+        'id': t.id,
+        'student_id': t.student_id,
+        'title': t.title,
+        'description': t.description,
+        'due_date': t.due_date.isoformat() if t.due_date else None,
+        'start_time': t.start_time.isoformat() if t.start_time else None,
+        'end_time': t.end_time.isoformat() if t.end_time else None,
+        'status': t.status.value,
+        'created_at': t.created_at.isoformat() if t.created_at else None,
+        'updated_at': t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+# -------- Scheduling Routes --------
+@app.route('/api/schedule', methods=['POST'])
+def create_schedule_event():
+    data = request.json or {}
+    required = ['teacher_id', 'title', 'start_time', 'end_time']
+    for f in required:
+        if not data.get(f):
+            return jsonify({'error': f'{f} is required'}), 400
+    # Validate teacher exists and is a TEACHER
+    teacher = User.query.get(data['teacher_id'])
+    if not teacher or teacher.role != UserRole.TEACHER:
+        return jsonify({'error': 'Invalid teacher_id'}), 400
+    start = _parse_iso(data.get('start_time'))
+    end = _parse_iso(data.get('end_time'))
+    if not start or not end:
+        return jsonify({'error': 'start_time and end_time must be ISO datetime strings'}), 400
+    if end <= start:
+        return jsonify({'error': 'end_time must be after start_time'}), 400
+    aud_str = (data.get('audience') or 'ALL').upper()
+    try:
+        audience = AudienceType(aud_str)
+    except Exception:
+        return jsonify({'error': 'audience must be one of ALL, SEMESTER, STUDENT'}), 400
+    semester = data.get('semester') if audience == AudienceType.SEMESTER else None
+    student_id = data.get('student_id') if audience == AudienceType.STUDENT else None
+    if audience == AudienceType.SEMESTER and not isinstance(semester, int):
+        return jsonify({'error': 'semester is required and must be integer for SEMESTER audience'}), 400
+    if audience == AudienceType.STUDENT:
+        stu = User.query.get(student_id) if student_id else None
+        if not stu or stu.role != UserRole.STUDENT:
+            return jsonify({'error': 'valid student_id is required for STUDENT audience'}), 400
+    ev = ScheduleEvent(
+        teacher_id=teacher.id,
+        title=data['title'],
+        description=data.get('description'),
+        subject_id=data.get('subject_id'),
+        location=data.get('location'),
+        start_time=start,
+        end_time=end,
+        audience=audience,
+        semester=semester,
+        student_id=student_id,
+    )
+    db.session.add(ev)
+    db.session.commit()
+    return jsonify(_event_to_json(ev)), 201
+
+@app.route('/api/schedule/teacher/<int:teacher_id>', methods=['GET'])
+def list_teacher_events(teacher_id: int):
+    teacher = User.query.get(teacher_id)
+    if not teacher or teacher.role != UserRole.TEACHER:
+        return jsonify({'error': 'Teacher not found'}), 404
+    q = ScheduleEvent.query.filter_by(teacher_id=teacher_id)
+    # Optional time window filters
+    start = _parse_iso(request.args.get('start'))
+    end = _parse_iso(request.args.get('end'))
+    if start:
+        q = q.filter(ScheduleEvent.end_time >= start)
+    if end:
+        q = q.filter(ScheduleEvent.start_time <= end)
+    items = q.order_by(ScheduleEvent.start_time.asc()).all()
+    return jsonify([_event_to_json(e) for e in items])
+
+@app.route('/api/schedule/student/<int:student_id>', methods=['GET'])
+def list_student_events(student_id: int):
+    student = User.query.get(student_id)
+    if not student or student.role != UserRole.STUDENT:
+        return jsonify({'error': 'Student not found'}), 404
+    start = _parse_iso(request.args.get('start'))
+    end = _parse_iso(request.args.get('end'))
+    q = ScheduleEvent.query
+    # Events visible to student: ALL, SEMESTER matching student's semester, or STUDENT targeted
+    from sqlalchemy import or_, and_
+    cond_all = ScheduleEvent.audience == AudienceType.ALL
+    cond_sem = and_(ScheduleEvent.audience == AudienceType.SEMESTER, ScheduleEvent.semester == student.semester)
+    cond_stu = and_(ScheduleEvent.audience == AudienceType.STUDENT, ScheduleEvent.student_id == student.id)
+    q = q.filter(or_(cond_all, cond_sem, cond_stu))
+    if start:
+        q = q.filter(ScheduleEvent.end_time >= start)
+    if end:
+        q = q.filter(ScheduleEvent.start_time <= end)
+    items = q.order_by(ScheduleEvent.start_time.asc()).all()
+    return jsonify([_event_to_json(e) for e in items])
+
+@app.route('/api/schedule/<int:event_id>', methods=['PUT', 'PATCH'])
+def update_schedule_event(event_id: int):
+    ev = ScheduleEvent.query.get_or_404(event_id)
+    data = request.json or {}
+    if 'title' in data:
+        ev.title = data['title'] or ev.title
+    if 'description' in data:
+        ev.description = data['description']
+    if 'subject_id' in data:
+        ev.subject_id = data['subject_id']
+    if 'location' in data:
+        ev.location = data['location']
+    if 'start_time' in data:
+        st = _parse_iso(data.get('start_time'))
+        if not st:
+            return jsonify({'error': 'start_time must be ISO datetime string'}), 400
+        ev.start_time = st
+    if 'end_time' in data:
+        et = _parse_iso(data.get('end_time'))
+        if not et:
+            return jsonify({'error': 'end_time must be ISO datetime string'}), 400
+        ev.end_time = et
+    if ev.end_time <= ev.start_time:
+        return jsonify({'error': 'end_time must be after start_time'}), 400
+    if 'audience' in data:
+        try:
+            ev.audience = AudienceType((data.get('audience') or '').upper())
+        except Exception:
+            return jsonify({'error': 'audience must be one of ALL, SEMESTER, STUDENT'}), 400
+    if ev.audience == AudienceType.SEMESTER:
+        if 'semester' in data:
+            if data['semester'] is None or not isinstance(data['semester'], int):
+                return jsonify({'error': 'semester must be integer for SEMESTER audience'}), 400
+            ev.semester = data['semester']
+        if ev.semester is None:
+            return jsonify({'error': 'semester is required for SEMESTER audience'}), 400
+        ev.student_id = None
+    elif ev.audience == AudienceType.STUDENT:
+        if 'student_id' in data:
+            stu = User.query.get(data['student_id']) if data['student_id'] else None
+            if not stu or stu.role != UserRole.STUDENT:
+                return jsonify({'error': 'valid student_id is required for STUDENT audience'}), 400
+            ev.student_id = stu.id
+        if not ev.student_id:
+            return jsonify({'error': 'student_id is required for STUDENT audience'}), 400
+        ev.semester = None
+    else:
+        ev.semester = None
+        ev.student_id = None
+    db.session.commit()
+    return jsonify(_event_to_json(ev))
+
+@app.route('/api/schedule/<int:event_id>', methods=['DELETE'])
+def delete_schedule_event(event_id: int):
+    ev = ScheduleEvent.query.get_or_404(event_id)
+    db.session.delete(ev)
+    db.session.commit()
+    return jsonify({'message': 'deleted'})
+
+# -------- Student Tasks (To-Do) Routes --------
+@app.route('/api/student-tasks', methods=['GET'])
+def list_student_tasks():
+    student_id = request.args.get('student_id', type=int)
+    if not student_id:
+        return jsonify({'error': 'student_id is required'}), 400
+    stu = User.query.get(student_id)
+    if not stu or stu.role != UserRole.STUDENT:
+        return jsonify({'error': 'Student not found'}), 404
+    q = StudentTask.query.filter_by(student_id=student_id)
+    start = _parse_iso(request.args.get('start'))
+    end = _parse_iso(request.args.get('end'))
+    if start:
+        q = q.filter((StudentTask.due_date == None) | (StudentTask.due_date >= start))
+    if end:
+        q = q.filter((StudentTask.due_date == None) | (StudentTask.due_date <= end))
+    items = q.order_by(StudentTask.due_date.is_(None), StudentTask.due_date.asc()).all()
+    return jsonify([_task_to_json(t) for t in items])
+
+@app.route('/api/student-tasks', methods=['POST'])
+def create_student_task():
+    data = request.json or {}
+    student_id = data.get('student_id')
+    title = data.get('title')
+    if not (student_id and title):
+        return jsonify({'error': 'student_id and title are required'}), 400
+    stu = User.query.get(student_id)
+    if not stu or stu.role != UserRole.STUDENT:
+        return jsonify({'error': 'Invalid student_id'}), 400
+    due = _parse_iso(data.get('due_date'))
+    st = _parse_iso(data.get('start_time'))
+    et = _parse_iso(data.get('end_time'))
+    # If both provided, ensure valid range
+    if st and et and et <= st:
+        return jsonify({'error': 'end_time must be after start_time'}), 400
+    status_str = (data.get('status') or 'PENDING').upper()
+    try:
+        status = TaskStatus(status_str)
+    except Exception:
+        return jsonify({'error': 'status must be PENDING or DONE'}), 400
+    t = StudentTask(
+        student_id=student_id,
+        title=title,
+        description=data.get('description'),
+        due_date=due,
+        start_time=st,
+        end_time=et,
+        status=status,
+    )
+    db.session.add(t)
+    db.session.commit()
+    return jsonify(_task_to_json(t)), 201
+
+@app.route('/api/student-tasks/<int:task_id>', methods=['PUT','PATCH'])
+def update_student_task(task_id: int):
+    t = StudentTask.query.get_or_404(task_id)
+    data = request.json or {}
+    if 'title' in data:
+        t.title = data['title'] or t.title
+    if 'description' in data:
+        t.description = data['description']
+    if 'due_date' in data:
+        t.due_date = _parse_iso(data.get('due_date'))
+    if 'start_time' in data:
+        t.start_time = _parse_iso(data.get('start_time'))
+    if 'end_time' in data:
+        t.end_time = _parse_iso(data.get('end_time'))
+    if t.start_time and t.end_time and t.end_time <= t.start_time:
+        return jsonify({'error': 'end_time must be after start_time'}), 400
+    if 'status' in data:
+        try:
+            t.status = TaskStatus((data.get('status') or '').upper())
+        except Exception:
+            return jsonify({'error': 'status must be PENDING or DONE'}), 400
+    db.session.commit()
+    return jsonify(_task_to_json(t))
+
+@app.route('/api/student-tasks/<int:task_id>', methods=['DELETE'])
+def delete_student_task(task_id: int):
+    t = StudentTask.query.get_or_404(task_id)
+    db.session.delete(t)
+    db.session.commit()
+    return jsonify({'message': 'deleted'})
 
 # Routes
 @app.route('/api/schemes', methods=['GET'])
@@ -754,15 +1093,21 @@ def generate_paper():
     for m in list(module_groups.keys()):
         random.shuffle(module_groups[m])
     # Selection helpers
-    used_ids = set()
-    used_texts = set()
+    # Track what we are choosing in this generation separately from recently used
+    chosen_ids = set()
+    chosen_texts = set()
+    blocked_ids = set()   # from recent drafts
+    blocked_texts = set() # from recent drafts (normalized)
     def norm_text(s):
         return (clean_question_text(s or '') or '').lower().strip()
     def pick_question(target_marks=None, prefer_rbt=None, prefer_co=None, prefer_module=None, ignore_rbt_allocation=False, ignore_module_allocation=False, allow_reuse=False):
         # 1) exact marks match with optional module/RBT constraints and not used
         search_pools = []
-        if prefer_module and prefer_module in module_groups and not ignore_module_allocation:
-            search_pools.append(module_groups.get(prefer_module, []))
+        if prefer_module and not ignore_module_allocation:
+            # Combine preferred module pool with unassigned (module 0) so that unassigned can satisfy any slot
+            pool_pref = list(module_groups.get(prefer_module, []))
+            pool_unassigned = list(module_groups.get(0, []))
+            search_pools.append(pool_pref + pool_unassigned)
         # fallback pool (any module) only when module distribution is not enforced or ignoring module allocation
         try:
             module_active = bool(module_percents)
@@ -772,9 +1117,13 @@ def generate_paper():
             search_pools.append(all_q)
         for pool in search_pools:
             for q in pool:
-                if q.id in used_ids and not allow_reuse:
+                # Always avoid repeating the same question within this paper
+                if q.id in chosen_ids:
                     continue
-                if target_marks is not None and q.marks == target_marks and (allow_reuse or norm_text(q.text) not in used_texts):
+                # If not allowing reuse, also avoid items blocked by recent drafts
+                if not allow_reuse and q.id in blocked_ids:
+                    continue
+                if target_marks is not None and q.marks == target_marks and (norm_text(q.text) not in chosen_texts) and (allow_reuse or norm_text(q.text) not in blocked_texts):
                     # If RBT distribution is active, ensure either preferred RBT matches or at least the level has remaining capacity
                     if prefer_rbt is not None:
                         if q.rbt_level == prefer_rbt:
@@ -790,16 +1139,18 @@ def generate_paper():
         # 2) any not used with preferred rbt/co
         for pool in search_pools:
             for q in pool:
-                if q.id in used_ids and not allow_reuse:
+                if q.id in chosen_ids:
                     continue
-                if prefer_rbt and q.rbt_level == prefer_rbt and (allow_reuse or norm_text(q.text) not in used_texts):
+                if not allow_reuse and q.id in blocked_ids:
+                    continue
+                if prefer_rbt and q.rbt_level == prefer_rbt and (norm_text(q.text) not in chosen_texts) and (allow_reuse or norm_text(q.text) not in blocked_texts):
                     # also ensure availability if RBT plan active
                     try:
                         if ignore_rbt_allocation or not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
                             return q
                     except Exception:
                         return q
-                if prefer_co and prefer_co in (q.co_tags or []) and (allow_reuse or norm_text(q.text) not in used_texts):
+                if prefer_co and prefer_co in (q.co_tags or []) and (norm_text(q.text) not in chosen_texts) and (allow_reuse or norm_text(q.text) not in blocked_texts):
                     # if RBT plan is active, still ensure availability for the question's level
                     try:
                         if ignore_rbt_allocation or not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
@@ -809,7 +1160,15 @@ def generate_paper():
         # 3) any not used
         for pool in search_pools:
             for q in pool:
-                if (q.id not in used_ids or allow_reuse) and (allow_reuse or norm_text(q.text) not in used_texts):
+                # final fallback respects non-repetition within this paper
+                if q.id in chosen_ids:
+                    continue
+                if not allow_reuse and q.id in blocked_ids:
+                    continue
+                if norm_text(q.text) in chosen_texts:
+                    continue
+                if not allow_reuse and norm_text(q.text) in blocked_texts:
+                    continue
                     # final fallback respects RBT availability if configured
                     try:
                         if ignore_rbt_allocation or not any(rbt_percents.values()) or rbt_allowed(q.rbt_level):
@@ -820,7 +1179,6 @@ def generate_paper():
 
     # Prepare module distribution plan based on percentages (over total parts)
     module_percents = config.get('module_percentages') or {}
-    best_effort = bool(config.get('best_effort'))
     # Normalize keys to int
     module_percents = {int(k): int(module_percents[k]) for k in module_percents.keys() if str(k).isdigit()}
     total_parts = 0
@@ -859,12 +1217,13 @@ def generate_paper():
     plan_idx = 0
 
     # Prepare RBT distribution plan based on percentages (L1-L6 over total parts)
-    rbt_percents = config.get('rbt_percentages') or {}
+    rbt_enabled = bool(config.get('rbt_enabled', True))
+    rbt_percents = (config.get('rbt_percentages') or {}) if rbt_enabled else {}
     # Normalize keys to canonical L1-L6 strings
     rbt_keys = ['L1','L2','L3','L4','L5','L6']
     rbt_percents = {k: int(rbt_percents.get(k, 0)) for k in rbt_keys}
     remaining_rbt = {}
-    if total_parts > 0 and any(rbt_percents.values()):
+    if rbt_enabled and total_parts > 0 and any(rbt_percents.values()):
         assigned = 0
         remainders = []
         for lvl, pct in rbt_percents.items():
@@ -882,7 +1241,7 @@ def generate_paper():
             leftover -= 1
             i = (i + 1) % max(1, len(remainders))
     def rbt_allowed(lvl):
-        if not any(rbt_percents.values()):
+        if not rbt_enabled or not any(rbt_percents.values()):
             return True
         return remaining_rbt.get(lvl, 0) > 0
     rbt_plan = []
@@ -899,7 +1258,10 @@ def generate_paper():
                     for p in r.get('parts', []):
                         sid = p.get('source_qid')
                         if sid:
-                            used_ids.add(sid)
+                            blocked_ids.add(sid)
+                        txt = p.get('text') or ''
+                        if txt:
+                            blocked_texts.add(norm_text(txt))
         except Exception:
             pass
 
@@ -911,27 +1273,42 @@ def generate_paper():
         # Try to fill from questions with subparts first
         # If a question has enough subparts, map them to parts
         chosen = None
+        # Pass 1: prefer subparts question that hasn't been chosen in this draft and not recently used
         for q in all_q:
-            if q.id in used_ids:
+            # never reuse the same question within the same generated paper
+            if q.id in chosen_ids:
+                continue
+            # avoid same normalized text selected already
+            if norm_text(q.text) in chosen_texts:
+                continue
+            # avoid recently used pool on first pass
+            if (q.id in blocked_ids or norm_text(q.text) in blocked_texts):
                 continue
             if q.subparts and len(q.subparts) >= len(parts):
                 # Enforce module percentages: require remaining capacity for this module to cover all parts
                 qm = q.module or 0
                 qlvl = q.rbt_level
-                rbt_ok = (not any(rbt_percents.values())) or (qlvl in remaining_rbt and remaining_rbt.get(qlvl, 0) >= len(parts))
+                rbt_ok = (not rbt_enabled or not any(rbt_percents.values())) or (qlvl in remaining_rbt and remaining_rbt.get(qlvl, 0) >= len(parts))
                 if (not module_percents or remaining_counts.get(qm, 0) >= len(parts)) and rbt_ok:
                     chosen = q
                     break
-        # Best-effort: if not found, allow ignoring allocations for subparts questions
-        if chosen is None and best_effort:
+        # Pass 2: allow recently used if nothing found yet
+        if chosen is None:
             for q in all_q:
-                # allow reuse under best-effort
+                if q.id in chosen_ids:
+                    continue
+                if norm_text(q.text) in chosen_texts:
+                    continue
                 if q.subparts and len(q.subparts) >= len(parts):
-                    chosen = q
-                    break
+                    qm = q.module or 0
+                    qlvl = q.rbt_level
+                    rbt_ok = (not rbt_enabled or not any(rbt_percents.values())) or (qlvl in remaining_rbt and remaining_rbt.get(qlvl, 0) >= len(parts))
+                    if (not module_percents or remaining_counts.get(qm, 0) >= len(parts)) and rbt_ok:
+                        chosen = q
+                        break
         if chosen is not None:
-            used_ids.add(chosen.id)
-            used_texts.add(norm_text(chosen.text))
+            chosen_ids.add(chosen.id)
+            chosen_texts.add(norm_text(chosen.text))
             for idx, p in enumerate(parts):
                 sp = chosen.subparts[idx]
                 row["parts"].append({
@@ -944,9 +1321,17 @@ def generate_paper():
                 })
             # Decrement remaining count for module and RBT for each part consumed
             if module_percents:
-                qm = chosen.module or 0
+                qm = chosen.module
+                qm_eff = None
                 if qm in remaining_counts:
-                    remaining_counts[qm] = max(0, remaining_counts[qm] - len(parts))
+                    qm_eff = qm
+                else:
+                    # allocate to any module with enough remaining, else any with >0
+                    qm_eff = next((m for m,cnt in remaining_counts.items() if cnt >= len(parts)), None)
+                    if qm_eff is None:
+                        qm_eff = next((m for m,cnt in remaining_counts.items() if cnt > 0), None)
+                if qm_eff is not None:
+                    remaining_counts[qm_eff] = max(0, remaining_counts[qm_eff] - len(parts))
             if any(rbt_percents.values()):
                 qlvl = chosen.rbt_level
                 if qlvl in remaining_rbt:
@@ -992,8 +1377,8 @@ def generate_paper():
                 if q is None:
                     q = pick_question(target_mk)
 
-            # Best-effort progressive relaxation if still not found
-            if q is None and best_effort:
+            # Progressive relaxation always: try to avoid blanks
+            if q is None:
                 # 1) keep module preference, ignore RBT allocation
                 if prefer_module is not None and module_allowed(prefer_module):
                     if prefer_rbt is not None:
@@ -1014,12 +1399,33 @@ def generate_paper():
                         q = pick_question(target_mk, prefer_rbt=prefer_rbt, allow_reuse=True, ignore_module_allocation=True)
                     if q is None:
                         q = pick_question(target_mk, allow_reuse=True, ignore_rbt_allocation=True, ignore_module_allocation=True)
+                # 5) final fill: ignore marks constraint entirely to avoid blanks
+                if q is None:
+                    # try with current preferences but no marks requirement
+                    if prefer_module is not None and module_allowed(prefer_module):
+                        if prefer_rbt is not None:
+                            q = pick_question(None, prefer_module=prefer_module, prefer_rbt=prefer_rbt, allow_reuse=True, ignore_rbt_allocation=True)
+                        if q is None:
+                            q = pick_question(None, prefer_module=prefer_module, allow_reuse=True, ignore_rbt_allocation=True)
+                    if q is None and prefer_rbt is not None:
+                        q = pick_question(None, prefer_rbt=prefer_rbt, allow_reuse=True, ignore_module_allocation=True)
+                    if q is None:
+                        q = pick_question(None, allow_reuse=True, ignore_rbt_allocation=True, ignore_module_allocation=True)
             if q is not None:
-                used_ids.add(q.id)
+                chosen_ids.add(q.id)
                 # decrement remaining for module if applicable
-                qm = q.module or prefer_module
-                if module_percents and qm is not None and qm in remaining_counts and remaining_counts[qm] > 0:
-                    remaining_counts[qm] -= 1
+                # Decrement effective module: question module if valid, else current preferred, else any with >0
+                qm = q.module
+                qm_eff = None
+                if module_percents:
+                    if qm in remaining_counts and remaining_counts[qm] > 0:
+                        qm_eff = qm
+                    elif 'prefer_module' in locals() and prefer_module in remaining_counts and remaining_counts[prefer_module] > 0:
+                        qm_eff = prefer_module
+                    else:
+                        qm_eff = next((m for m,cnt in remaining_counts.items() if cnt > 0), None)
+                    if qm_eff is not None:
+                        remaining_counts[qm_eff] -= 1
                 # decrement remaining for RBT if applicable
                 if any(rbt_percents.values()):
                     qlvl = q.rbt_level or prefer_rbt
@@ -1027,7 +1433,7 @@ def generate_paper():
                         remaining_rbt[qlvl] -= 1
                 plan_idx += 1
                 rbt_idx += 1
-                used_texts.add(norm_text(q.text))
+                chosen_texts.add(norm_text(q.text))
                 row["parts"].append({
                     "label": p,
                     "text": clean_question_text(q.text),
@@ -1088,6 +1494,109 @@ def paper_draft(draft_id):
                 setattr(draft, field, data[field])
     db.session.commit()
     return jsonify({"ok": True})
+
+# -------- User Registration --------
+@app.route('/api/register', methods=['POST'])
+def register_user():
+    """Register a new user (teacher or student)"""
+    data = request.json or {}
+    
+    # Required fields
+    required_fields = ['firebase_uid', 'email', 'first_name', 'last_name', 'role']
+    for field in required_fields:
+        if not data.get(field):
+            return jsonify({"error": f"{field} is required"}), 400
+    
+    # Validate role
+    try:
+        user_role = UserRole(data['role'].upper())
+    except ValueError:
+        return jsonify({"error": "Invalid role. Must be 'teacher' or 'student'"}), 400
+    
+    # Check for existing user
+    existing_user = User.query.filter(
+        (User.email == data['email']) | (User.firebase_uid == data['firebase_uid'])
+    ).first()
+    if existing_user:
+        return jsonify({"error": "User with this email or Firebase UID already exists"}), 400
+    
+    # Validate role-specific fields
+    if user_role == UserRole.TEACHER and not data.get('department'):
+        return jsonify({"error": "Department is required for teachers"}), 400
+    
+    if user_role == UserRole.STUDENT and not data.get('semester'):
+        return jsonify({"error": "Semester is required for students"}), 400
+    
+    # Create new user
+    try:
+        user = User(
+            firebase_uid=data['firebase_uid'],
+            email=data['email'],
+            first_name=data['first_name'],
+            last_name=data['last_name'],
+            role=user_role,
+            department=data.get('department') if user_role == UserRole.TEACHER else None,
+            semester=data.get('semester') if user_role == UserRole.STUDENT else None,
+            is_active=True
+        )
+        
+        db.session.add(user)
+        db.session.commit()
+        
+        return jsonify({
+            "id": user.id,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "role": user.role.value,
+            "department": user.department,
+            "semester": user.semester,
+            "created_at": user.created_at.isoformat()
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to register user: {str(e)}"}), 500
+
+@app.route('/api/users/<firebase_uid>', methods=['GET'])
+def get_user(firebase_uid):
+    """Get user details by Firebase UID"""
+    user = User.query.filter_by(firebase_uid=firebase_uid, is_active=True).first()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    
+    return jsonify({
+        "id": user.id,
+        "email": user.email,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "role": user.role.value,
+        "department": user.department,
+        "semester": user.semester,
+        "created_at": user.created_at.isoformat()
+    })
+
+@app.route('/api/users/<firebase_uid>', methods=['PUT'])
+def update_user(firebase_uid):
+    """Update user details"""
+    user = User.query.filter_by(firebase_uid=firebase_uid, is_active=True).first()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    
+    data = request.json or {}
+    
+    
+    updatable_fields = ['first_name', 'last_name', 'department', 'semester']
+    for field in updatable_fields:
+        if field in data:
+            setattr(user, field, data[field])
+    
+    try:
+        db.session.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to update user: {str(e)}"}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
