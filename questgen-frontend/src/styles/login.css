@@ -1,0 +1,9 @@
+.login-card{ width:420px; max-width:92vw; }
+.login-card.card{ padding:28px 30px; border-radius:16px }
+.lock{ width:56px; height:56px; margin:0 auto 10px; border-radius:999px; background:linear-gradient(180deg,#a78bfa,#7c3aed) }
+.google.btn{ width:100%; margin:8px 0 6px; background:linear-gradient(180deg,#93c5fd,#6366f1) }
+.or{ text-align:center; color:var(--muted); margin:8px 0 10px }
+.or span{ background:#fff; padding:0 8px }
+.form{ display:grid; gap:10px; margin:8px 0 10px }
+.error{ background:#fee2e2; color:#991b1b; border:1px solid #fecaca; padding:8px 10px; border-radius:10px; margin-bottom:8px }
+.muter{ color:var(--muted); text-align:center }

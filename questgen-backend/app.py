@@ -5,6 +5,7 @@ from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 import enum
 import pdfplumber
+import tempfile
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "http://localhost:3000"}})
@@ -984,7 +985,7 @@ def export_paper(draft_id):
     html_parts = [
         '<html><head><meta charset="utf-8"/>'
         '<style>'
-        '  body{font-family:Arial, sans-serif; background:#fff; color:#111;}'
+        '  body{font-family:Arial, sans-serif; background:#fff; color:#111; margin:0; padding:0;}'
         '  .container{max-width:900px;margin:24px auto;padding:0 12px;}'
         '  .center{text-align:center;}'
         '  .banner{display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:12px;}'
@@ -999,6 +1000,8 @@ def export_paper(draft_id):
         '  .hdr td{border:1px solid #aaa}'
         '  .or{ text-align:center; font-weight:bold }'
         '  .signs{display:flex;justify-content:space-between;margin-top:40px}'
+        '  @media print { body { margin: 0.5in; } .container { margin: 0; max-width: 100%; } }'
+        '  @page { margin: 0.5in; size: A4; }'
         '</style></head><body>',
         '<div class="container">',
         '<div class="banner">',
@@ -1039,6 +1042,13 @@ def export_paper(draft_id):
             rbt_cell.append(p.get('rbt') or '')
         html_parts.append(f"<tr><td>{esc(qno)}</td><td>{''.join(q_text)}</td><td>{esc(total_marks)}</td><td>{esc(' | '.join([c for c in co_cell if c]))}</td><td>{esc(' | '.join([r for r in rbt_cell if r]))}</td></tr>")
     html_parts.append('</table>')
+
+    # Count actual questions (excluding OR rows)
+    question_count = len([r for r in rows if r.get('type') != 'or'])
+    
+    # Add page break before CO table if more than 8 questions
+    if question_count > 8:
+        html_parts.append('<div style="page-break-before:always;"></div>')
 
     # CO table
     co_table = co_table_override if co_table_override is not None else (draft.co_table or [])
@@ -1585,7 +1595,7 @@ def update_user(firebase_uid):
     
     data = request.json or {}
     
-    
+
     updatable_fields = ['first_name', 'last_name', 'department', 'semester']
     for field in updatable_fields:
         if field in data:
