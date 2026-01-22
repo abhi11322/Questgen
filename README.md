@@ -1,4 +1,8 @@
+
 # QuestGen - Question Paper Generation System
+=======
+# QuestGen - Automate, Generate , Educate
+
 
 A web-based system for generating and managing question papers for educational institutions. Allows teachers to create papers and manage study materials, while providing students access to resources.
 
